@@ -1,6 +1,10 @@
 namespace CachedInventory;
 
+using System.Security.Cryptography.X509Certificates;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.TagHelpers.Cache;
+using Microsoft.AspNetCore.SignalR;
+using Microsoft.Extensions.Caching.Memory;
 
 public static class CachedInventoryApiBuilder
 {
@@ -13,7 +17,7 @@ public static class CachedInventoryApiBuilder
     builder.Services.AddEndpointsApiExplorer();
     builder.Services.AddSwaggerGen();
     builder.Services.AddScoped<IWarehouseStockSystemClient, WarehouseStockSystemClient>();
-
+    builder.Services.AddMemoryCache();
     var app = builder.Build();
 
     // Configure the HTTP request pipeline.
@@ -25,15 +29,36 @@ public static class CachedInventoryApiBuilder
 
     app.UseHttpsRedirection();
 
+    var cache = app.Services.GetRequiredService<IMemoryCache>();
+    cache.Set(
+      "key",
+      "value",
+      new MemoryCacheEntryOptions { AbsoluteExpirationRelativeToNow = TimeSpan.FromSeconds(300) }
+    );
+
     app.MapGet(
         "/stock/{productId:int}",
-        async ([FromServices] IWarehouseStockSystemClient client, int productId) => await client.GetStock(productId))
+        async ([FromServices] IWarehouseStockSystemClient client, int productId) =>
+        {
+          var cacheKey = $"stock_{productId}";
+
+          if (!cache.TryGetValue(cacheKey, out int cachedStock))
+          {
+            cachedStock = await client.GetStock(productId);
+            cache.Set(cacheKey, cachedStock);
+          }
+          return cachedStock;
+        }
+      )
       .WithName("GetStock")
       .WithOpenApi();
 
     app.MapPost(
         "/stock/retrieve",
-        async ([FromServices] IWarehouseStockSystemClient client, [FromBody] RetrieveStockRequest req) =>
+        async (
+          [FromServices] IWarehouseStockSystemClient client,
+          [FromBody] RetrieveStockRequest req
+        ) =>
         {
           var stock = await client.GetStock(req.ProductId);
           if (stock < req.Amount)
@@ -43,10 +68,10 @@ public static class CachedInventoryApiBuilder
 
           await client.UpdateStock(req.ProductId, stock - req.Amount);
           return Results.Ok();
-        })
+        }
+      )
       .WithName("RetrieveStock")
       .WithOpenApi();
-
 
     app.MapPost(
         "/stock/restock",
@@ -55,7 +80,8 @@ public static class CachedInventoryApiBuilder
           var stock = await client.GetStock(req.ProductId);
           await client.UpdateStock(req.ProductId, req.Amount + stock);
           return Results.Ok();
-        })
+        }
+      )
       .WithName("Restock")
       .WithOpenApi();
 
