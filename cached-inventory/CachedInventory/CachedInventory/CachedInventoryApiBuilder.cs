@@ -1,9 +1,6 @@
 namespace CachedInventory;
 
-using System.Security.Cryptography.X509Certificates;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.AspNetCore.Mvc.TagHelpers.Cache;
-using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.Caching.Memory;
 
 public static class CachedInventoryApiBuilder
@@ -60,13 +57,20 @@ public static class CachedInventoryApiBuilder
           [FromBody] RetrieveStockRequest req
         ) =>
         {
-          var stock = await client.GetStock(req.ProductId);
-          if (stock < req.Amount)
+          var cacheKey = $"stock_{req.ProductId}";
+
+          if (!cache.TryGetValue(cacheKey, out int cachedStock))
+          {
+            cachedStock = await client.GetStock(req.ProductId);
+          }
+
+          if (cachedStock < req.Amount)
           {
             return Results.BadRequest("Not enough stock.");
           }
 
-          await client.UpdateStock(req.ProductId, stock - req.Amount);
+          await client.UpdateStock(req.ProductId, cachedStock - req.Amount);
+          cache.Set(cacheKey, cachedStock - req.Amount);
           return Results.Ok();
         }
       )
@@ -77,8 +81,15 @@ public static class CachedInventoryApiBuilder
         "/stock/restock",
         async ([FromServices] IWarehouseStockSystemClient client, [FromBody] RestockRequest req) =>
         {
-          var stock = await client.GetStock(req.ProductId);
-          await client.UpdateStock(req.ProductId, req.Amount + stock);
+          var cacheKey = $"stock_{req.ProductId}";
+
+          if (!cache.TryGetValue(cacheKey, out int cachedStock))
+          {
+            cachedStock = await client.GetStock(req.ProductId);
+          }
+
+          await client.UpdateStock(req.ProductId, req.Amount + cachedStock);
+          cache.Set(cacheKey, req.Amount + cachedStock);
           return Results.Ok();
         }
       )
