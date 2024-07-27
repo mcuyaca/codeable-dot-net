@@ -1,5 +1,4 @@
-namespace CachedInventory;
-
+using CachedInventory;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Caching.Memory;
 
@@ -10,11 +9,16 @@ public static class CachedInventoryApiBuilder
     var builder = WebApplication.CreateBuilder(args);
 
     // Add services to the container.
-    // Learn more about configuring Swagger/OpenAPI at https://aka.ms/aspnetcore/swashbuckle
     builder.Services.AddEndpointsApiExplorer();
     builder.Services.AddSwaggerGen();
     builder.Services.AddScoped<IWarehouseStockSystemClient, WarehouseStockSystemClient>();
     builder.Services.AddMemoryCache();
+
+    builder.Services.AddSingleton<BackgroundStockUpdateService>();
+    builder.Services.AddHostedService(provider =>
+      provider.GetRequiredService<BackgroundStockUpdateService>()
+    );
+
     var app = builder.Build();
 
     // Configure the HTTP request pipeline.
@@ -26,24 +30,22 @@ public static class CachedInventoryApiBuilder
 
     app.UseHttpsRedirection();
 
+    var backgroundStockUpdateService =
+      app.Services.GetRequiredService<BackgroundStockUpdateService>();
     var cache = app.Services.GetRequiredService<IMemoryCache>();
-    cache.Set(
-      "key",
-      "value",
-      new MemoryCacheEntryOptions { AbsoluteExpirationRelativeToNow = TimeSpan.FromSeconds(300) }
-    );
 
     app.MapGet(
         "/stock/{productId:int}",
         async ([FromServices] IWarehouseStockSystemClient client, int productId) =>
         {
-          var cacheKey = $"stock_{productId}";
+          var cacheKey = productId;
 
           if (!cache.TryGetValue(cacheKey, out int cachedStock))
           {
             cachedStock = await client.GetStock(productId);
             cache.Set(cacheKey, cachedStock);
           }
+
           return cachedStock;
         }
       )
@@ -57,7 +59,7 @@ public static class CachedInventoryApiBuilder
           [FromBody] RetrieveStockRequest req
         ) =>
         {
-          var cacheKey = $"stock_{req.ProductId}";
+          var cacheKey = req.ProductId;
 
           if (!cache.TryGetValue(cacheKey, out int cachedStock))
           {
@@ -69,8 +71,8 @@ public static class CachedInventoryApiBuilder
             return Results.BadRequest("Not enough stock.");
           }
 
-          await client.UpdateStock(req.ProductId, cachedStock - req.Amount);
           cache.Set(cacheKey, cachedStock - req.Amount);
+          backgroundStockUpdateService.QueueStockUpdate(req.ProductId, cachedStock - req.Amount);
           return Results.Ok();
         }
       )
@@ -81,15 +83,16 @@ public static class CachedInventoryApiBuilder
         "/stock/restock",
         async ([FromServices] IWarehouseStockSystemClient client, [FromBody] RestockRequest req) =>
         {
-          var cacheKey = $"stock_{req.ProductId}";
+          var cacheKey = req.ProductId;
 
           if (!cache.TryGetValue(cacheKey, out int cachedStock))
           {
             cachedStock = await client.GetStock(req.ProductId);
           }
 
-          await client.UpdateStock(req.ProductId, req.Amount + cachedStock);
-          cache.Set(cacheKey, req.Amount + cachedStock);
+          cache.Set(cacheKey, cachedStock + req.Amount);
+          backgroundStockUpdateService.QueueStockUpdate(req.ProductId, cachedStock + req.Amount);
+
           return Results.Ok();
         }
       )

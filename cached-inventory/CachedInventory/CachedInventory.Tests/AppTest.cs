@@ -23,18 +23,25 @@ public class FourRetrievalsSequentially
 public class SevenRetrievalsInParallel
 {
   [Fact(DisplayName = "retirar siete productos en paralelo")]
-  public static async Task Test() => await TestApiPerformance.Test(4, [1, 2, 3, 4, 5, 6, 7], true, 500);
+  public static async Task Test() =>
+    await TestApiPerformance.Test(4, [1, 2, 3, 4, 5, 6, 7], true, 500);
 }
 
 public class SevenRetrievalsSequentially
 {
   [Fact(DisplayName = "retirar siete productos secuencialmente")]
-  public static async Task Test() => await TestApiPerformance.Test(5, [1, 2, 3, 4, 5, 6, 7], false, 500);
+  public static async Task Test() =>
+    await TestApiPerformance.Test(5, [1, 2, 3, 4, 5, 6, 7], false, 500);
 }
 
 internal static class TestApiPerformance
 {
-  internal static async Task Test(int productId, int[] retrievals, bool isParallel, long expectedPerformance)
+  internal static async Task Test(
+    int productId,
+    int[] retrievals,
+    bool isParallel,
+    long expectedPerformance
+  )
   {
     await using var setup = await TestSetup.Initialize();
     await setup.Restock(productId, retrievals.Sum());
@@ -56,7 +63,8 @@ internal static class TestApiPerformance
     Assert.True(finalStock == 0, $"El stock final no es 0, sino {finalStock}.");
     Assert.True(
       setup.AverageRequestDuration < expectedPerformance,
-      $"Duración promedio: {setup.AverageRequestDuration}ms, se esperaba un máximo de {expectedPerformance}ms.");
+      $"Duración promedio: {setup.AverageRequestDuration}ms, se esperaba un máximo de {expectedPerformance}ms."
+    );
     await setup.VerifyStockFromFile(productId, 0);
   }
 }
