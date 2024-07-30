@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -10,9 +10,10 @@ using Microsoft.Extensions.Logging;
 public class BackgroundStockUpdateService : BackgroundService
 {
   private readonly IServiceScopeFactory _scopeFactory;
-  private readonly ConcurrentDictionary<int, int> _updates = new ConcurrentDictionary<int, int>();
+  private readonly Dictionary<int, int> _updates = new Dictionary<int, int>();
+  private readonly SemaphoreSlim _semaphore = new SemaphoreSlim(1, 1);
   private readonly ILogger<BackgroundStockUpdateService> _logger;
-  private readonly TimeSpan _waitTime = TimeSpan.FromSeconds(1);
+  private readonly TimeSpan _waitTime = TimeSpan.FromSeconds(9);
 
   public BackgroundStockUpdateService(
     IServiceScopeFactory scopeFactory,
@@ -23,10 +24,18 @@ public class BackgroundStockUpdateService : BackgroundService
     _logger = logger;
   }
 
-  public void QueueStockUpdate(int productId, int amount)
+  public async Task QueueStockUpdate(int productId, int amount)
   {
     _logger.LogWarning("New request with Id {productId} to amount {Amount}.", productId, amount);
-    _updates[productId] = amount; // Reemplaza la cantidad existente para el producto
+    await _semaphore.WaitAsync();
+    try
+    {
+      _updates[productId] = amount; // Reemplaza la cantidad existente para el producto
+    }
+    finally
+    {
+      _semaphore.Release();
+    }
   }
 
   protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -47,20 +56,29 @@ public class BackgroundStockUpdateService : BackgroundService
     CancellationToken stoppingToken
   )
   {
+    Dictionary<int, int> updatesToProcess;
+    await _semaphore.WaitAsync(stoppingToken);
     try
     {
-      foreach (var keyValue in _updates.ToList())
+      updatesToProcess = new Dictionary<int, int>(_updates);
+      _updates.Clear();
+    }
+    finally
+    {
+      _semaphore.Release();
+    }
+
+    try
+    {
+      foreach (var keyValue in updatesToProcess)
       {
-        if (_updates.TryRemove(keyValue.Key, out int amount))
-        {
-          _logger.LogInformation(
-            "Updating product with Id {ProductId} to amount {Amount}.",
-            keyValue.Key,
-            amount
-          );
-          await warehouseStockSystem.UpdateStock(keyValue.Key, amount);
-          _logger.LogInformation("Product with Id {ProductId} finished updating.", keyValue.Key);
-        }
+        _logger.LogInformation(
+          "Updating product with Id {ProductId} to amount {Amount}.",
+          keyValue.Key,
+          keyValue.Value
+        );
+        await warehouseStockSystem.UpdateStock(keyValue.Key, keyValue.Value);
+        _logger.LogInformation("Product with Id {ProductId} finished updating.", keyValue.Key);
       }
     }
     catch (Exception ex)
