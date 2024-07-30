@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using CachedInventory;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Caching.Memory;
@@ -7,6 +8,8 @@ public static class CachedInventoryApiBuilder
   public static WebApplication Build(string[] args)
   {
     var builder = WebApplication.CreateBuilder(args);
+    var semaphores = new ConcurrentDictionary<int, SemaphoreSlim>();
+    var timers = new ConcurrentDictionary<int, Timer>();
 
     // Add services to the container.
     builder.Services.AddEndpointsApiExplorer();
@@ -15,10 +18,9 @@ public static class CachedInventoryApiBuilder
     builder.Services.AddMemoryCache();
 
     builder.Services.AddSingleton<BackgroundStockUpdateService>();
-    builder.Services.AddHostedService(provider =>
-      provider.GetRequiredService<BackgroundStockUpdateService>()
-    );
 
+    builder.Services.AddSingleton(semaphores);
+    builder.Services.AddSingleton(timers);
     var app = builder.Build();
 
     // Configure the HTTP request pipeline.
@@ -56,24 +58,33 @@ public static class CachedInventoryApiBuilder
         "/stock/retrieve",
         async (
           [FromServices] IWarehouseStockSystemClient client,
+          [FromServices] ConcurrentDictionary<int, SemaphoreSlim> semaphores,
           [FromBody] RetrieveStockRequest req
         ) =>
         {
-          var cacheKey = req.ProductId;
-
-          if (!cache.TryGetValue(cacheKey, out int cachedStock))
+          var semaphore = semaphores.GetOrAdd(req.ProductId, new SemaphoreSlim(1, 1));
+          await semaphore.WaitAsync();
+          try
           {
-            cachedStock = await client.GetStock(req.ProductId);
-          }
+            if (!cache.TryGetValue(req.ProductId, out int cachedStock))
+            {
+              cachedStock = await client.GetStock(req.ProductId);
+            }
 
-          if (cachedStock < req.Amount)
+            if (cachedStock < req.Amount)
+            {
+              return Results.BadRequest("Not enough stock.");
+            }
+
+            cache.Set(req.ProductId, cachedStock - req.Amount);
+            ResetTimer(req.ProductId, client, cache, timers);
+            //  backgroundStockUpdateService.QueueStockUpdate(req.ProductId, cachedStock - req.Amount);
+            return Results.Ok();
+          }
+          finally
           {
-            return Results.BadRequest("Not enough stock.");
+            semaphore.Release();
           }
-
-          cache.Set(cacheKey, cachedStock - req.Amount);
-          backgroundStockUpdateService.QueueStockUpdate(req.ProductId, cachedStock - req.Amount);
-          return Results.Ok();
         }
       )
       .WithName("RetrieveStock")
@@ -81,25 +92,72 @@ public static class CachedInventoryApiBuilder
 
     app.MapPost(
         "/stock/restock",
-        async ([FromServices] IWarehouseStockSystemClient client, [FromBody] RestockRequest req) =>
+        async (
+          [FromServices] IWarehouseStockSystemClient client,
+          [FromServices] ConcurrentDictionary<int, SemaphoreSlim> semaphores,
+          [FromBody] RestockRequest req
+        ) =>
         {
-          var cacheKey = req.ProductId;
-
-          if (!cache.TryGetValue(cacheKey, out int cachedStock))
+          var semaphore = semaphores.GetOrAdd(req.ProductId, new SemaphoreSlim(1, 1));
+          await semaphore.WaitAsync();
+          try
           {
-            cachedStock = await client.GetStock(req.ProductId);
+            var cacheKey = req.ProductId;
+
+            if (!cache.TryGetValue(cacheKey, out int cachedStock))
+            {
+              cachedStock = await client.GetStock(req.ProductId);
+            }
+
+            cache.Set(cacheKey, cachedStock + req.Amount);
+            ResetTimer(req.ProductId, client, cache, timers);
+            // backgroundStockUpdateService.QueueStockUpdate(req.ProductId, cachedStock + req.Amount);
+
+            return Results.Ok();
           }
-
-          cache.Set(cacheKey, cachedStock + req.Amount);
-          backgroundStockUpdateService.QueueStockUpdate(req.ProductId, cachedStock + req.Amount);
-
-          return Results.Ok();
+          finally
+          {
+            semaphore.Release();
+          }
         }
       )
       .WithName("Restock")
       .WithOpenApi();
 
     return app;
+  }
+
+  private static void ResetTimer(
+    int productId,
+    IWarehouseStockSystemClient client,
+    IMemoryCache cache,
+    ConcurrentDictionary<int, Timer> timers
+  )
+  {
+    if (timers.TryGetValue(productId, out var existingTimer))
+    {
+      existingTimer.Change(100, Timeout.Infinite);
+    }
+    else
+    {
+      var newTimer = new Timer(
+        async state =>
+        {
+          if (state != null)
+          {
+            var pid = (int)state;
+            if (cache.TryGetValue(pid, out int stock))
+            {
+              await client.UpdateStock(pid, stock);
+            }
+          }
+        },
+        productId,
+        100,
+        Timeout.Infinite
+      );
+      timers[productId] = newTimer;
+    }
   }
 }
 

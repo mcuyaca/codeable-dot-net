@@ -12,7 +12,7 @@ public class BackgroundStockUpdateService : BackgroundService
   private readonly IServiceScopeFactory _scopeFactory;
   private readonly ConcurrentDictionary<int, int> _updates = new ConcurrentDictionary<int, int>();
   private readonly ILogger<BackgroundStockUpdateService> _logger;
-  private readonly TimeSpan _waitTime = TimeSpan.FromSeconds(1);
+  private readonly TimeSpan _waitTime = TimeSpan.FromSeconds(3);
 
   public BackgroundStockUpdateService(
     IServiceScopeFactory scopeFactory,
