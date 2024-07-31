@@ -1,26 +1,79 @@
+namespace CachedInventory;
+
 using System.Collections.Concurrent;
-using CachedInventory;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.Extensions.Caching.Memory;
+
+public interface ILegacySyncService
+{
+  Task UpdateCache();
+  void MarkForUpdate(int productId);
+}
+
+public class TrackerLegacySync(IWarehouseStockSystemClient client, IOperationsTracker tracker)
+  : ILegacySyncService
+{
+  private readonly SemaphoreSlim semaphore = new(1);
+  private readonly Dictionary<int, DateTime> updateQueue = new();
+  private DateTime lastUpdatedAt = DateTime.UtcNow;
+
+  public async Task UpdateCache()
+  {
+    int[] toUpdate;
+    try
+    {
+      await semaphore.WaitAsync();
+      toUpdate = updateQueue.Where(kv => kv.Value < lastUpdatedAt).Select(kv => kv.Key).ToArray();
+      lastUpdatedAt = DateTime.UtcNow;
+    }
+    finally
+    {
+      semaphore.Release();
+    }
+
+    await Task.WhenAll(
+      toUpdate.Select(async id =>
+      {
+        var actions = await tracker.GetActionsByProductId(id);
+        var stock = actions.Sum();
+        await client.UpdateStock(id, stock);
+      })
+    );
+  }
+
+  public void MarkForUpdate(int productId)
+  {
+    try
+    {
+      semaphore.Wait();
+      updateQueue[productId] = DateTime.UtcNow;
+    }
+    finally
+    {
+      semaphore.Release();
+    }
+  }
+}
+
+public record ProductCacheItem(int ProductId, int Stock);
 
 public static class CachedInventoryApiBuilder
 {
+  private static readonly ConcurrentDictionary<int, ProductCacheItem> ProductCache = new();
+  private static readonly ConcurrentDictionary<int, SemaphoreSlim> ProductLocks = new();
+
   public static WebApplication Build(string[] args)
   {
     var builder = WebApplication.CreateBuilder(args);
-    var semaphores = new ConcurrentDictionary<int, SemaphoreSlim>();
-    var timers = new ConcurrentDictionary<int, Timer>();
 
     // Add services to the container.
+    // Learn more about configuring Swagger/OpenAPI at https://aka.ms/aspnetcore/swashbuckle
     builder.Services.AddEndpointsApiExplorer();
     builder.Services.AddSwaggerGen();
-    builder.Services.AddScoped<IWarehouseStockSystemClient, WarehouseStockSystemClient>();
+    builder.Services.AddSingleton<IWarehouseStockSystemClient, WarehouseStockSystemClient>();
+    builder.Services.AddSingleton<IOperationsTracker, OperationsTracker>();
+    builder.Services.AddSingleton<ILegacySyncService, TrackerLegacySync>();
     builder.Services.AddMemoryCache();
 
-    builder.Services.AddSingleton<BackgroundStockUpdateService>();
-
-    builder.Services.AddSingleton(semaphores);
-    builder.Services.AddSingleton(timers);
     var app = builder.Build();
 
     // Configure the HTTP request pipeline.
@@ -32,24 +85,13 @@ public static class CachedInventoryApiBuilder
 
     app.UseHttpsRedirection();
 
-    var backgroundStockUpdateService =
-      app.Services.GetRequiredService<BackgroundStockUpdateService>();
-    var cache = app.Services.GetRequiredService<IMemoryCache>();
-
     app.MapGet(
         "/stock/{productId:int}",
-        async ([FromServices] IWarehouseStockSystemClient client, int productId) =>
-        {
-          var cacheKey = productId;
-
-          if (!cache.TryGetValue(cacheKey, out int cachedStock))
-          {
-            cachedStock = await client.GetStock(productId);
-            cache.Set(cacheKey, cachedStock);
-          }
-
-          return cachedStock;
-        }
+        async (
+          [FromServices] IWarehouseStockSystemClient client,
+          [FromServices] IOperationsTracker tracker,
+          int productId
+        ) => await GetStockWithCache(client, tracker, productId)
       )
       .WithName("GetStock")
       .WithOpenApi();
@@ -58,27 +100,28 @@ public static class CachedInventoryApiBuilder
         "/stock/retrieve",
         async (
           [FromServices] IWarehouseStockSystemClient client,
-          [FromServices] ConcurrentDictionary<int, SemaphoreSlim> semaphores,
+          [FromServices] IOperationsTracker tracker,
+          [FromServices] ILegacySyncService syncService,
           [FromBody] RetrieveStockRequest req
         ) =>
         {
-          var semaphore = semaphores.GetOrAdd(req.ProductId, new SemaphoreSlim(1, 1));
-          await semaphore.WaitAsync();
+          var semaphore = ProductLocks.GetOrAdd(req.ProductId, _ => new(1));
           try
           {
-            if (!cache.TryGetValue(req.ProductId, out int cachedStock))
-            {
-              cachedStock = await client.GetStock(req.ProductId);
-            }
-
-            if (cachedStock < req.Amount)
+            await semaphore.WaitAsync();
+            var stock = await GetStockWithCache(client, tracker, req.ProductId);
+            if (stock < req.Amount)
             {
               return Results.BadRequest("Not enough stock.");
             }
 
-            cache.Set(req.ProductId, cachedStock - req.Amount);
-            ResetTimer(req.ProductId, client, cache, timers);
-            //  backgroundStockUpdateService.QueueStockUpdate(req.ProductId, cachedStock - req.Amount);
+            await tracker.CreateOperationsTracker(DateTime.UtcNow, req.ProductId, -req.Amount);
+            ProductCache.AddOrUpdate(
+              req.ProductId,
+              new ProductCacheItem(req.ProductId, -req.Amount),
+              (_, item) => item with { Stock = item.Stock - req.Amount }
+            );
+            syncService.MarkForUpdate(req.ProductId);
             return Results.Ok();
           }
           finally
@@ -94,25 +137,22 @@ public static class CachedInventoryApiBuilder
         "/stock/restock",
         async (
           [FromServices] IWarehouseStockSystemClient client,
-          [FromServices] ConcurrentDictionary<int, SemaphoreSlim> semaphores,
+          [FromServices] IOperationsTracker tracker,
+          [FromServices] ILegacySyncService syncService,
           [FromBody] RestockRequest req
         ) =>
         {
-          var semaphore = semaphores.GetOrAdd(req.ProductId, new SemaphoreSlim(1, 1));
-          await semaphore.WaitAsync();
+          var semaphore = ProductLocks.GetOrAdd(req.ProductId, _ => new(1));
           try
           {
-            var cacheKey = req.ProductId;
-
-            if (!cache.TryGetValue(cacheKey, out int cachedStock))
-            {
-              cachedStock = await client.GetStock(req.ProductId);
-            }
-
-            cache.Set(cacheKey, cachedStock + req.Amount);
-            ResetTimer(req.ProductId, client, cache, timers);
-            // backgroundStockUpdateService.QueueStockUpdate(req.ProductId, cachedStock + req.Amount);
-
+            await semaphore.WaitAsync();
+            await tracker.CreateOperationsTracker(DateTime.UtcNow, req.ProductId, req.Amount);
+            syncService.MarkForUpdate(req.ProductId);
+            ProductCache.AddOrUpdate(
+              req.ProductId,
+              new ProductCacheItem(req.ProductId, req.Amount),
+              (_, item) => item with { Stock = item.Stock + req.Amount }
+            );
             return Results.Ok();
           }
           finally
@@ -124,40 +164,49 @@ public static class CachedInventoryApiBuilder
       .WithName("Restock")
       .WithOpenApi();
 
+    var legacySyncService = app.Services.GetRequiredService<ILegacySyncService>();
+
+    _ = Task.Run(async () =>
+    {
+      while (true)
+      {
+        try
+        {
+          await Task.Delay(10);
+          await legacySyncService.UpdateCache();
+        }
+        catch (Exception e)
+        {
+          Console.WriteLine(e);
+        }
+      }
+      // ReSharper disable once FunctionNeverReturns
+    });
+
+    app.Lifetime.ApplicationStopping.Register(() =>
+    {
+      using var scope = app.Services.CreateScope();
+      var trackerService = scope.ServiceProvider.GetRequiredService<IOperationsTracker>();
+      trackerService.RemoveCache().GetAwaiter().GetResult();
+    });
     return app;
   }
 
-  private static void ResetTimer(
-    int productId,
+  public static async Task<int> GetStockWithCache(
     IWarehouseStockSystemClient client,
-    IMemoryCache cache,
-    ConcurrentDictionary<int, Timer> timers
+    IOperationsTracker tracker,
+    int productId
   )
   {
-    if (timers.TryGetValue(productId, out var existingTimer))
+    if (ProductCache.TryGetValue(productId, out var cacheItem))
     {
-      existingTimer.Change(100, Timeout.Infinite);
+      var actions = await tracker.GetActionsByProductId(productId);
+      return cacheItem.Stock + actions.Sum();
     }
-    else
-    {
-      var newTimer = new Timer(
-        async state =>
-        {
-          if (state != null)
-          {
-            var pid = (int)state;
-            if (cache.TryGetValue(pid, out int stock))
-            {
-              await client.UpdateStock(pid, stock);
-            }
-          }
-        },
-        productId,
-        100,
-        Timeout.Infinite
-      );
-      timers[productId] = newTimer;
-    }
+
+    var stock = await client.GetStock(productId);
+    ProductCache.TryAdd(productId, new(productId, stock));
+    return stock;
   }
 }
 
