@@ -34,22 +34,38 @@ public class SevenRetrievalsSequentially
     await TestApiPerformance.Test(5, [1, 2, 3, 4, 5, 6, 7], false, 500);
 }
 
+public class NotEnoughStock
+{
+  [Fact(DisplayName = "retirar un producto sin stock")]
+  public static async Task Test() => await TestApiPerformance.Test(6, [7], false, 200, 6);
+}
+
 internal static class TestApiPerformance
 {
   internal static async Task Test(
     int productId,
     int[] retrievals,
     bool isParallel,
-    long expectedPerformance
+    long expectedPerformance,
+    int initialRetrive = 0
   )
   {
     await using var setup = await TestSetup.Initialize();
-    await setup.Restock(productId, retrievals.Sum());
-    await setup.VerifyStockFromFile(productId, retrievals.Sum());
+    await setup.Restock(productId, retrievals.Sum() - initialRetrive);
+    await setup.VerifyStockFromFile(productId, retrievals.Sum() - initialRetrive);
     var tasks = new List<Task>();
     foreach (var retrieval in retrievals)
     {
-      var task = setup.Retrieve(productId, retrieval);
+      Task task;
+      if (initialRetrive == 0)
+      {
+        task = setup.Retrieve(productId, retrieval);
+      }
+      else
+      {
+        task = setup.Retrieve(productId, retrieval, true);
+      }
+
       if (!isParallel)
       {
         await task;
@@ -60,11 +76,16 @@ internal static class TestApiPerformance
 
     await Task.WhenAll(tasks);
     var finalStock = await setup.GetStock(productId);
-    Assert.True(finalStock == 0, $"El stock final no es 0, sino {finalStock}.");
+    if (initialRetrive == 0)
+    {
+      Assert.True(finalStock == 0, $"El stock final no es 0, sino {finalStock}.");
+    }
+
     Assert.True(
       setup.AverageRequestDuration < expectedPerformance,
       $"Duración promedio: {setup.AverageRequestDuration}ms, se esperaba un máximo de {expectedPerformance}ms."
     );
-    await setup.VerifyStockFromFile(productId, 0);
+
+    await setup.VerifyStockFromFile(productId, finalStock);
   }
 }

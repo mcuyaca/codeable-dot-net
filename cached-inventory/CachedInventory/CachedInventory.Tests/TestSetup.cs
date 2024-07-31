@@ -27,7 +27,8 @@ public record TestSetup(string Url) : IAsyncDisposable
     var fileStock = await WarehouseStockSystemClient.GetStockDirectlyFromFile(productId);
     Assert.True(
       fileStock == expectedStock,
-      $"El fichero no se actualizó correctamente. Stock en el fichero: {fileStock}. Stock esperado: {expectedStock}.");
+      $"El fichero no se actualizó correctamente. Stock en el fichero: {fileStock}. Stock esperado: {expectedStock}."
+    );
   }
 
   public async Task<int> GetStock(int productId, bool isFirst = false)
@@ -40,7 +41,10 @@ public record TestSetup(string Url) : IAsyncDisposable
     {
       requestDurations.Add(stopwatch.ElapsedMilliseconds);
     }
-    Assert.True(response.IsSuccessStatusCode, $"Error al obtener el stock del producto {productId}.");
+    Assert.True(
+      response.IsSuccessStatusCode,
+      $"Error al obtener el stock del producto {productId}."
+    );
     return int.Parse(content);
   }
 
@@ -60,7 +64,10 @@ public record TestSetup(string Url) : IAsyncDisposable
         var response = await Client.PostAsync($"{Url}stock/restock", restockRequestContent);
         stopwatch.Stop();
         requestDurations.Add(stopwatch.ElapsedMilliseconds);
-        Assert.True(response.IsSuccessStatusCode, $"Error al reponer el stock del producto {productId}.");
+        Assert.True(
+          response.IsSuccessStatusCode,
+          $"Error al reponer el stock del producto {productId}."
+        );
         return;
       }
       case < 0:
@@ -69,7 +76,7 @@ public record TestSetup(string Url) : IAsyncDisposable
     }
   }
 
-  public async Task Retrieve(int productId, int amount)
+  public async Task Retrieve(int productId, int amount, bool withError = false)
   {
     var retrieveRequest = new { productId, amount };
     var retrieveRequestJson = JsonSerializer.Serialize(retrieveRequest);
@@ -79,7 +86,21 @@ public record TestSetup(string Url) : IAsyncDisposable
     var response = await Client.PostAsync($"{Url}stock/retrieve", retrieveRequestContent);
     stopwatch.Stop();
     requestDurations.Add(stopwatch.ElapsedMilliseconds);
-    Assert.True(response.IsSuccessStatusCode, $"Error al retirar el stock del producto {productId}.");
+
+    if (withError)
+    {
+      Assert.False(
+        response.IsSuccessStatusCode,
+        $"Error al retirar el stock del producto {productId}."
+      );
+    }
+    else
+    {
+      Assert.True(
+        response.IsSuccessStatusCode,
+        $"Error al retirar el stock del producto {productId}."
+      );
+    }
   }
 
   private static int GetRandomPort() => Random.Next(30000) + 10000;
@@ -92,7 +113,8 @@ public record TestSetup(string Url) : IAsyncDisposable
     {
       return Go(GetRandomPort());
 
-      int Go(int pn) => GetConnectionInfo().Any(ci => ci.LocalEndPoint.Port == pn) ? Go(GetRandomPort()) : pn;
+      int Go(int pn) =>
+        GetConnectionInfo().Any(ci => ci.LocalEndPoint.Port == pn) ? Go(GetRandomPort()) : pn;
     }
     finally
     {
@@ -103,7 +125,6 @@ public record TestSetup(string Url) : IAsyncDisposable
   // ReSharper disable once ReturnTypeCanBeEnumerable.Local
   private static TcpConnectionInformation[] GetConnectionInfo() =>
     IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpConnections();
-
 
   public static async Task<TestSetup> Initialize()
   {
@@ -136,7 +157,10 @@ public record TestSetup(string Url) : IAsyncDisposable
 
         return setup.Value.url;
       }
-      finally { TrackerSemaphore.Release(); }
+      finally
+      {
+        TrackerSemaphore.Release();
+      }
     }
 
     internal static async Task TryDispose()
@@ -151,7 +175,10 @@ public record TestSetup(string Url) : IAsyncDisposable
           setup = null;
         }
       }
-      finally { TrackerSemaphore.Release(); }
+      finally
+      {
+        TrackerSemaphore.Release();
+      }
     }
   }
 }
